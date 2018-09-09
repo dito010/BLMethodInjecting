@@ -6,6 +6,7 @@
 #import "BLMethodInjecting.h"
 #import "JRSwizzle.h"
 #import <pthread.h>
+#import <JRSwizzle.h>
 #import <objc/runtime.h>
 
 typedef struct BLSpecialProtocol {
@@ -21,7 +22,7 @@ static size_t bl_specialProtocolsReady = 0;
 static pthread_mutex_t bl_specialProtocolsLock = PTHREAD_MUTEX_INITIALIZER;
 static dispatch_semaphore_t bl_specialProtocolsSemaphore;
 
-BOOL bl_loadSpecialProtocol(Protocol *protocol, Class containerClass) {
+BOOL bl_loadSpecialProtocol (Protocol *protocol, Class containerClass) {
     @autoreleasepool {
         NSCParameterAssert(protocol != nil);
         if (pthread_mutex_lock(&bl_specialProtocolsLock) != 0) {
@@ -103,7 +104,7 @@ static void bl_orderSpecialProtocols(void) {
     });
 }
 
-void bl_specialProtocolReadyForInjection(Protocol *protocol) {
+void bl_specialProtocolReadyForInjection (Protocol *protocol) {
     @autoreleasepool {
         NSCParameterAssert(protocol != nil);
 
@@ -159,13 +160,9 @@ static void bl_injectConcreteProtocolInjectMethod(Class containerClass, Class pa
     for (unsigned methodIndex = 0;methodIndex < imethodCount;++methodIndex) {
         Method method = imethodList[methodIndex];
         SEL selector = method_getName(method);
-        if (class_getInstanceMethod(pairClass, selector)) {
-            continue;
-        }
         IMP imp = method_getImplementation(method);
         const char *types = method_getTypeEncoding(method);
-        bool success = class_addMethod(pairClass, selector, imp, types);
-        assert(success);
+        class_addMethod(pairClass, selector, imp, types);
     }
     free(imethodList); imethodList = NULL;
     (void)[containerClass class];
@@ -181,27 +178,17 @@ static void bl_injectConcreteProtocolInjectMethod(Class containerClass, Class pa
         if (selector == @selector(initialize)) {
             continue;
         }
-        if (class_getInstanceMethod(metaclass, selector)) {
-            continue;
-        }
 
         IMP imp = method_getImplementation(method);
         const char *types = method_getTypeEncoding(method);
-        bool success = class_addMethod(metaclass, selector, imp, types);
-        assert(success);
+        class_addMethod(metaclass, selector, imp, types);
     }
 
     free(cmethodList); cmethodList = NULL;
     (void)[containerClass class];
 }
 
-static NSArray * bl_injectMethod(id object, Class pairClass) {
-    assert(object);
-    assert(pairClass);
-    if(!object || !pairClass) {
-        return nil;
-    }
-
+static NSArray * bl_injectMethod(id object) {
     NSMutableArray *bl_matchSpecialProtocolsToClass = @[].mutableCopy;
     for (size_t i = 0;i < bl_specialProtocolCount;++i) {
         @autoreleasepool {
@@ -221,17 +208,11 @@ static NSArray * bl_injectMethod(id object, Class pairClass) {
     for(NSValue *value in bl_matchSpecialProtocolsToClass) {
         [value getValue:&protocol];
         bl_injectConcreteProtocolInjectMethod(protocol.containerClass, [object class]);
-        bl_injectConcreteProtocolInjectMethod(protocol.containerClass, pairClass);
     }
     return bl_matchSpecialProtocolsToClass.copy;
 }
 
-static id bl_retrieveForwardTargetForSelector(id object, bool isInstanceMethod) {
-    assert(object);
-    if(!object) {
-        return nil;
-    }
-
+static bool bl_resolveMethodForObject(id object) {
     @autoreleasepool {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
@@ -240,19 +221,11 @@ static id bl_retrieveForwardTargetForSelector(id object, bool isInstanceMethod) 
 
         dispatch_semaphore_wait(bl_specialProtocolsSemaphore, DISPATCH_TIME_FOREVER);
 
-        // 新建当前类的子类来响应对应的方法.
-        const char *pairClassName = [[NSStringFromClass([object class]) stringByReplacingOccurrencesOfString:@"_BLInjectingPairClass" withString:@""] stringByAppendingString:@"_BLInjectingPairClass"].UTF8String;
-        Class pairClass = objc_getClass(pairClassName);
-        if(!pairClass) {
-            pairClass = objc_allocateClassPair([object class], pairClassName, 0);
-            objc_registerClassPair(pairClass);
-        }
-
         // 处理继承自有注入的父类.
         Class currentClass = [object class];
         NSArray *matchSpecialProtocolsToClass = nil;
         do {
-            NSArray *protocols = bl_injectMethod(currentClass, pairClass);
+            NSArray *protocols = bl_injectMethod(currentClass);
             if(!matchSpecialProtocolsToClass) {
                 matchSpecialProtocolsToClass = protocols;
             }
@@ -263,26 +236,16 @@ static id bl_retrieveForwardTargetForSelector(id object, bool isInstanceMethod) 
             return nil;
         }
 
-        id forwardTarget = pairClass;
-        if(isInstanceMethod) {
-            @try {
-                forwardTarget = [pairClass new];
-            }
-            @catch(id exp) {
-                forwardTarget = [pairClass alloc];
-                NSLog(@"初始化注入 pairClass 实例对象时调用的 init 方法不是指定的初始化方法, 但是对方法注入没有影响, 错误信息: %@", exp);
-            }
-        }
         dispatch_semaphore_signal(bl_specialProtocolsSemaphore);
-        return forwardTarget;
+        return YES;
     }
 }
 
-BOOL bl_addConcreteProtocol(Protocol *protocol, Class containerClass) {
+BOOL bl_addConcreteProtocol (Protocol *protocol, Class containerClass) {
     return bl_loadSpecialProtocol(protocol, containerClass);
 }
 
-void bl_loadConcreteProtocol(Protocol *protocol) {
+void bl_loadConcreteProtocol (Protocol *protocol) {
     bl_specialProtocolReadyForInjection(protocol);
 }
 
@@ -295,30 +258,28 @@ void bl_loadConcreteProtocol(Protocol *protocol) {
 + (void)load {
     NSError *iError;
     NSError *cError;
-    [self jr_swizzleMethod:@selector(forwardingTargetForSelector:)
-                withMethod:@selector(blinjecting_forwardingTargetForSelector:)
-                     error:&iError];
-    [self jr_swizzleClassMethod:@selector(forwardingTargetForSelector:)
-                withClassMethod:@selector(blinjecting_forwardingTargetForSelector:)
+    [self jr_swizzleClassMethod:@selector(resolveInstanceMethod:)
+                withClassMethod:@selector(blinjecting_resolveInstanceMethod:)
+                          error:&iError];
+    [self jr_swizzleClassMethod:@selector(resolveClassMethod:)
+                withClassMethod:@selector(blinjecting_resolveClassMethod:)
                           error:&cError];
     NSParameterAssert(!iError);
     NSParameterAssert(!cError);
 }
 
-+ (id)blinjecting_forwardingTargetForSelector:(SEL)aSelector {
-    id target = bl_retrieveForwardTargetForSelector(self, NO);
-    if(target) {
-        return target;
++ (BOOL)blinjecting_resolveClassMethod:(SEL)sel {
+    if(bl_resolveMethodForObject(self)) {
+        return YES;
     }
-    return [self blinjecting_forwardingTargetForSelector:aSelector];
+    return [self blinjecting_resolveClassMethod:sel];
 }
 
-- (id)blinjecting_forwardingTargetForSelector:(SEL)aSelector {
-    id target = bl_retrieveForwardTargetForSelector(self, YES);
-    if(target) {
-        return target;
++ (BOOL)blinjecting_resolveInstanceMethod:(SEL)sel {
+    if(bl_resolveMethodForObject(self)) {
+        return YES;
     }
-    return [self blinjecting_forwardingTargetForSelector:aSelector];
+    return [self blinjecting_resolveInstanceMethod:sel];
 }
 
 @end
