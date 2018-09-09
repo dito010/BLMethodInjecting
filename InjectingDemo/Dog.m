@@ -21,4 +21,13 @@
     return self;
 }
 
++ (void)sleep {
+    NSLog(@"Dog sleeping");
+}
+
++ (void)sayHello {
+    [super sayHello];
+    NSLog(@"Dog say hello");
+}
+
 @end

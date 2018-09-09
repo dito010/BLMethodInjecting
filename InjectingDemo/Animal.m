@@ -6,7 +6,10 @@
 #import "Animal.h"
 
 
-@implementation Animal {
+@implementation Animal
 
++ (void)sayHello {
+    NSLog(@"Animal say hello");
 }
+
 @end
