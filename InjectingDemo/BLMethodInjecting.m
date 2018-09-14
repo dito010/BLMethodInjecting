@@ -20,7 +20,7 @@ static size_t bl_specialProtocolCount = 0;
 static size_t bl_specialProtocolCapacity = 0;
 static size_t bl_specialProtocolsReady = 0;
 static pthread_mutex_t bl_specialProtocolsLock = PTHREAD_MUTEX_INITIALIZER;
-static dispatch_semaphore_t bl_specialProtocolsSemaphore;
+static NSRecursiveLock *blinjecting_recursiveLock;
 
 BOOL bl_loadSpecialProtocol (Protocol *protocol, Class containerClass) {
     @autoreleasepool {
@@ -29,53 +29,53 @@ BOOL bl_loadSpecialProtocol (Protocol *protocol, Class containerClass) {
             fprintf(stderr, "ERROR: Could not synchronize on special protocol data\n");
             return NO;
         }
-
+        
         if (bl_specialProtocolCount == SIZE_MAX) {
             pthread_mutex_unlock(&bl_specialProtocolsLock);
             return NO;
         }
-
+        
         if (bl_specialProtocolCount >= bl_specialProtocolCapacity) {
             size_t newCapacity;
             if (bl_specialProtocolCapacity == 0)
                 newCapacity = 1;
             else {
                 newCapacity = bl_specialProtocolCapacity << 1;
-
+                
                 if (newCapacity < bl_specialProtocolCapacity) {
                     newCapacity = SIZE_MAX;
-
+                    
                     if (newCapacity <= bl_specialProtocolCapacity) {
                         pthread_mutex_unlock(&bl_specialProtocolsLock);
                         return NO;
                     }
                 }
             }
-
+            
             void * restrict ptr = realloc(bl_specialProtocols, sizeof(*bl_specialProtocols) * newCapacity);
             if (!ptr) {
                 pthread_mutex_unlock(&bl_specialProtocolsLock);
                 return NO;
             }
-
+            
             bl_specialProtocols = ptr;
             bl_specialProtocolCapacity = newCapacity;
         }
         assert(bl_specialProtocolCount < bl_specialProtocolCapacity);
-
+        
 #ifndef __clang_analyzer__
-
+        
         bl_specialProtocols[bl_specialProtocolCount] = (BLSpecialProtocol){
-                .protocol = protocol,
-                .containerClass = containerClass,
-                .ready = NO,
+            .protocol = protocol,
+            .containerClass = containerClass,
+            .ready = NO,
         };
 #endif
-
+        
         ++bl_specialProtocolCount;
         pthread_mutex_unlock(&bl_specialProtocolsLock);
     }
-
+    
     return YES;
 }
 
@@ -83,21 +83,21 @@ static void bl_orderSpecialProtocols(void) {
     qsort_b(bl_specialProtocols, bl_specialProtocolCount, sizeof(BLSpecialProtocol), ^(const void *a, const void *b){
         if (a == b)
             return 0;
-
+        
         const BLSpecialProtocol *protoA = a;
         const BLSpecialProtocol *protoB = b;
-
+        
         int (^protocolInjectionPriority)(const BLSpecialProtocol *) = ^(const BLSpecialProtocol *specialProtocol){
             int runningTotal = 0;
-
+            
             for (size_t i = 0;i < bl_specialProtocolCount;++i) {
                 if (specialProtocol == bl_specialProtocols + i)
                     continue;
-
+                
                 if (protocol_conformsToProtocol(specialProtocol->protocol, bl_specialProtocols[i].protocol))
                     runningTotal++;
             }
-
+            
             return runningTotal;
         };
         return protocolInjectionPriority(protoB) - protocolInjectionPriority(protoA);
@@ -107,7 +107,7 @@ static void bl_orderSpecialProtocols(void) {
 void bl_specialProtocolReadyForInjection (Protocol *protocol) {
     @autoreleasepool {
         NSCParameterAssert(protocol != nil);
-
+        
         if (pthread_mutex_lock(&bl_specialProtocolsLock) != 0) {
             fprintf(stderr, "ERROR: Could not synchronize on special protocol data\n");
             return;
@@ -120,11 +120,11 @@ void bl_specialProtocolReadyForInjection (Protocol *protocol) {
                     if (++bl_specialProtocolsReady == bl_specialProtocolCount)
                         bl_orderSpecialProtocols();
                 }
-
+                
                 break;
             }
         }
-
+        
         pthread_mutex_unlock(&bl_specialProtocolsLock);
     }
 }
@@ -139,17 +139,17 @@ static void bl_logInstanceAndClassMethod(Class cls) {
         NSLog(@"%@", [NSString stringWithFormat:@"-[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(selector)]);
     }
     free(imethodList); imethodList = NULL;
-
+    
     unsigned cmethodCount = 0;
     Method *cmethodList = class_copyMethodList(object_getClass(cls), &cmethodCount);
-
+    
     NSLog(@"class Method--------------------");
     for (unsigned methodIndex = 0;methodIndex < cmethodCount;++methodIndex) {
         Method method = cmethodList[methodIndex];
         SEL selector = method_getName(method);
         NSLog(@"%@", [NSString stringWithFormat:@"+[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(selector)]);
     }
-
+    
     free(cmethodList); cmethodList = NULL;
     NSLog(@"end----------------------------------------");
 }
@@ -166,24 +166,24 @@ static void bl_injectConcreteProtocolInjectMethod(Class containerClass, Class pa
     }
     free(imethodList); imethodList = NULL;
     (void)[containerClass class];
-
+    
     unsigned cmethodCount = 0;
     Method *cmethodList = class_copyMethodList(object_getClass(containerClass), &cmethodCount);
-
+    
     Class metaclass = object_getClass(pairClass);
     for (unsigned methodIndex = 0;methodIndex < cmethodCount;++methodIndex) {
         Method method = cmethodList[methodIndex];
         SEL selector = method_getName(method);
-
+        
         if (selector == @selector(initialize)) {
             continue;
         }
-
+        
         IMP imp = method_getImplementation(method);
         const char *types = method_getTypeEncoding(method);
         class_addMethod(metaclass, selector, imp, types);
     }
-
+    
     free(cmethodList); cmethodList = NULL;
     (void)[containerClass class];
 }
@@ -199,11 +199,11 @@ static NSArray * bl_injectMethod(id object) {
             [bl_matchSpecialProtocolsToClass addObject:[NSValue value:&bl_specialProtocols[i] withObjCType:@encode(struct BLSpecialProtocol)]];
         }
     }
-
+    
     if(!bl_matchSpecialProtocolsToClass.count) {
         return nil;
     }
-
+    
     struct BLSpecialProtocol protocol;
     for(NSValue *value in bl_matchSpecialProtocolsToClass) {
         [value getValue:&protocol];
@@ -216,11 +216,11 @@ static bool bl_resolveMethodForObject(id object) {
     @autoreleasepool {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            bl_specialProtocolsSemaphore = dispatch_semaphore_create(1);
+            blinjecting_recursiveLock = [NSRecursiveLock new];
         });
-
-        dispatch_semaphore_wait(bl_specialProtocolsSemaphore, DISPATCH_TIME_FOREVER);
-
+        
+        [blinjecting_recursiveLock lock];
+        
         // 处理继承自有注入的父类.
         Class currentClass = [object class];
         NSArray *matchSpecialProtocolsToClass = nil;
@@ -230,13 +230,13 @@ static bool bl_resolveMethodForObject(id object) {
                 matchSpecialProtocolsToClass = protocols;
             }
         }while((currentClass = class_getSuperclass(currentClass)));
-
+        
         if(!matchSpecialProtocolsToClass.count) {
-            dispatch_semaphore_signal(bl_specialProtocolsSemaphore);
+            [blinjecting_recursiveLock unlock];
             return nil;
         }
-
-        dispatch_semaphore_signal(bl_specialProtocolsSemaphore);
+        
+        [blinjecting_recursiveLock unlock];
         return YES;
     }
 }
